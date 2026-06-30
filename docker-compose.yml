@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: sga_militar_db
+    environment:
+      POSTGRES_USER: sga
+      POSTGRES_PASSWORD: sga_dev
+      POSTGRES_DB: sga_militar
+    ports:
+      - "5433:5432"
+    volumes:
+      - sga_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sga -d sga_militar"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  sga_pgdata:

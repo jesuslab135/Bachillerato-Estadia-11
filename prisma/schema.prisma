@@ -1,0 +1,352 @@
+// SGA-Militar — modelo de datos (docs/modelo.md).
+// Las CHECKs, el índice parcial de periodo activo y los triggers append-only se
+// añaden en migración SQL cruda (Prisma no los expresa nativamente). Ver
+// prisma/migrations/*/migration.sql tras `prisma migrate dev`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────── Enums de dominio ───────────────────────────
+
+enum EstatusCadete {
+  Activo
+  BajaTemporal
+  BajaDefinitiva
+}
+
+enum RolUsuario {
+  Docente
+  Coordinador
+  Operador
+}
+
+enum EstadoParcial {
+  Borrador
+  CerradoDocente
+  Validado
+  Reabierto
+}
+
+enum TipoCategoria {
+  TI
+  TE
+  TA
+}
+
+enum CodigoAsistencia {
+  A
+  F
+  R
+  J
+}
+
+enum TipoExamen {
+  Parcial
+  Ordinario
+  Extraordinario
+  TDS
+}
+
+enum EstatusExamen {
+  PRESENTADO
+  NP
+}
+
+// ─────────────────────────── Catálogos ───────────────────────────
+
+model Plantel {
+  id        String   @id @default(uuid())
+  clave     String   @unique
+  nombre    String
+  direccion String?
+  activo    Boolean  @default(true)
+
+  grupos    Grupo[]
+  periodos  Periodo[]
+  cadetes   Cadete[]
+  usuarios  Usuario[]
+}
+
+model Materia {
+  id                String  @id @default(uuid())
+  clave             String  @unique
+  nombre            String
+  semestreAplicable Int     @map("semestre_aplicable")
+  activo            Boolean @default(true) // borrado lógico (RF-CAT-06)
+
+  cursos            Curso[]
+
+  @@map("materia")
+}
+
+model Grupo {
+  id        String  @id @default(uuid())
+  plantelId String  @map("plantel_id")
+  nombre    String
+  semestre  Int
+  activo    Boolean @default(true)
+
+  plantel   Plantel @relation(fields: [plantelId], references: [id])
+  cadetes   Cadete[]
+  cursos    Curso[]
+
+  @@unique([plantelId, nombre])
+  @@map("grupo")
+}
+
+model Periodo {
+  id          String   @id @default(uuid())
+  plantelId   String   @map("plantel_id")
+  codigo      String
+  fechaInicio DateTime @map("fecha_inicio") @db.Date
+  fechaFin    DateTime @map("fecha_fin") @db.Date
+  activo      Boolean  @default(false)
+
+  plantel     Plantel  @relation(fields: [plantelId], references: [id])
+  cursos      Curso[]
+
+  // Solo un periodo activo por plantel: índice único parcial en migración SQL.
+  @@unique([plantelId, codigo])
+  @@map("periodo")
+}
+
+model Cadete {
+  matricula      String        @id
+  nombreCompleto String        @map("nombre_completo")
+  plantelId      String        @map("plantel_id")
+  grupoActualId  String?       @map("grupo_actual_id")
+  estatus        EstatusCadete @default(Activo)
+  fechaBaja      DateTime?     @map("fecha_baja") @db.Date
+
+  plantel        Plantel       @relation(fields: [plantelId], references: [id])
+  grupoActual    Grupo?        @relation(fields: [grupoActualId], references: [id])
+
+  asistencias    Asistencia[]
+  calificaciones Calificacion[]
+  examenes       Examen[]
+  puntosExtra    PuntoExtra[]
+
+  @@map("cadete")
+}
+
+model Usuario {
+  id               String      @id @default(uuid())
+  // Operador es global → plantel opcional.
+  plantelId        String?     @map("plantel_id")
+  nombreCompleto   String      @map("nombre_completo")
+  email            String      @unique
+  hashContrasena   String      @map("hash_contrasena")
+  rol              RolUsuario
+  activo           Boolean     @default(true)
+  fechaUltimoAcceso DateTime?  @map("fecha_ultimo_acceso")
+  // Auth (I3): RF-AUTH-04 primer ingreso, RF-AUTH-05 bloqueo por intentos fallidos.
+  debeCambiarContrasena Boolean   @default(true) @map("debe_cambiar_contrasena")
+  intentosFallidos      Int       @default(0) @map("intentos_fallidos")
+  bloqueadoHasta        DateTime? @map("bloqueado_hasta")
+
+  plantel          Plantel?    @relation(fields: [plantelId], references: [id])
+  cursosImpartidos Curso[]     @relation("DocenteCurso")
+
+  @@map("usuario")
+}
+
+// ─────────────────────────── Operativas ───────────────────────────
+
+model Curso {
+  id         String        @id @default(uuid())
+  materiaId  String        @map("materia_id")
+  grupoId    String        @map("grupo_id")
+  docenteId  String        @map("docente_id")
+  periodoId  String        @map("periodo_id")
+  estado     String        @default("Activo")
+
+  materia    Materia       @relation(fields: [materiaId], references: [id])
+  grupo      Grupo         @relation(fields: [grupoId], references: [id])
+  docente    Usuario       @relation("DocenteCurso", fields: [docenteId], references: [id])
+  periodo    Periodo       @relation(fields: [periodoId], references: [id])
+
+  parciales  Parcial[]
+  asistencias Asistencia[]
+  actas      Acta[]
+
+  // No se duplica la combinación (Materia × Grupo × Docente × Periodo). RF-ASIG-01.
+  @@unique([materiaId, grupoId, docenteId, periodoId])
+  @@map("curso")
+}
+
+model Parcial {
+  id          String        @id @default(uuid())
+  cursoId     String        @map("curso_id")
+  numero      Int           // 1..3, exactamente 3 por curso (CHECK + unique)
+  estado      EstadoParcial @default(Borrador)
+  pesoTI      Decimal       @map("peso_ti") @db.Decimal(4, 3)
+  pesoTE      Decimal       @map("peso_te") @db.Decimal(4, 3)
+  pesoTA      Decimal       @map("peso_ta") @db.Decimal(4, 3)
+  pesoEX      Decimal       @map("peso_ex") @db.Decimal(4, 3)
+  fechaInicio DateTime?     @map("fecha_inicio") @db.Date
+  fechaFin    DateTime?     @map("fecha_fin") @db.Date
+
+  curso       Curso         @relation(fields: [cursoId], references: [id])
+  criterios   Criterio[]
+  actividades Actividad[]
+  examenes    Examen[]
+  puntosExtra PuntoExtra[]
+  workflowEvents WorkflowEvent[]
+
+  @@unique([cursoId, numero])
+  @@map("parcial")
+}
+
+model Criterio {
+  id        String        @id @default(uuid())
+  parcialId String        @map("parcial_id")
+  tipo      TipoCategoria
+  orden     Int           // 1..5
+  nombre    String
+  peso      Decimal       @db.Decimal(5, 4)
+
+  parcial   Parcial       @relation(fields: [parcialId], references: [id])
+  actividades Actividad[]
+
+  // Exactamente 15 por parcial (5 por tipo): unicidad (parcial,tipo,orden) + CHECK orden 1..5.
+  @@unique([parcialId, tipo, orden])
+  @@map("criterio")
+}
+
+model Actividad {
+  id         String        @id @default(uuid())
+  parcialId  String        @map("parcial_id")
+  tipo       TipoCategoria
+  orden      Int           // 1..30
+  nombre     String
+  fecha      DateTime?     @db.Date
+  criterioId String?       @map("criterio_id")
+
+  parcial    Parcial       @relation(fields: [parcialId], references: [id])
+  criterio   Criterio?     @relation(fields: [criterioId], references: [id])
+  calificaciones Calificacion[]
+
+  // Máximo 30 por (parcial, tipo): unicidad de orden + CHECK orden 1..30.
+  @@unique([parcialId, tipo, orden])
+  @@map("actividad")
+}
+
+model Asistencia {
+  id              String           @id @default(uuid())
+  cadeteMatricula String           @map("cadete_matricula")
+  cursoId         String           @map("curso_id")
+  fecha           DateTime         @db.Date
+  codigo          CodigoAsistencia
+  capturadaPor    String           @map("capturada_por")
+  capturadaEn     DateTime         @default(now()) @map("capturada_en")
+
+  cadete          Cadete           @relation(fields: [cadeteMatricula], references: [matricula])
+  curso           Curso            @relation(fields: [cursoId], references: [id])
+
+  // Asistencia única por (cadete, curso, fecha).
+  @@unique([cadeteMatricula, cursoId, fecha])
+  @@map("asistencia")
+}
+
+model Calificacion {
+  id              String    @id @default(uuid())
+  cadeteMatricula String    @map("cadete_matricula")
+  actividadId     String    @map("actividad_id")
+  valor           Decimal?  @db.Decimal(4, 2) // [0,10] o null; CHECK en migración
+  capturadaPor    String    @map("capturada_por")
+  capturadaEn     DateTime  @default(now()) @map("capturada_en")
+
+  cadete          Cadete    @relation(fields: [cadeteMatricula], references: [matricula])
+  actividad       Actividad @relation(fields: [actividadId], references: [id])
+
+  @@unique([cadeteMatricula, actividadId])
+  @@map("calificacion")
+}
+
+model Examen {
+  id              String        @id @default(uuid())
+  cadeteMatricula String        @map("cadete_matricula")
+  parcialId       String        @map("parcial_id")
+  tipo            TipoExamen
+  // valor null ⇔ estatus NP (CHECK en migración). Si no, valor ∈ [0,10].
+  valor           Decimal?      @db.Decimal(4, 2)
+  estatus         EstatusExamen @default(PRESENTADO)
+  capturadoPor    String        @map("capturado_por")
+
+  cadete          Cadete        @relation(fields: [cadeteMatricula], references: [matricula])
+  parcial         Parcial       @relation(fields: [parcialId], references: [id])
+
+  @@unique([cadeteMatricula, parcialId, tipo])
+  @@map("examen")
+}
+
+model PuntoExtra {
+  id              String   @id @default(uuid())
+  cadeteMatricula String   @map("cadete_matricula")
+  parcialId       String   @map("parcial_id")
+  aplica          Boolean  @default(false)
+  motivo          String?
+
+  cadete          Cadete   @relation(fields: [cadeteMatricula], references: [matricula])
+  parcial         Parcial  @relation(fields: [parcialId], references: [id])
+
+  @@unique([cadeteMatricula, parcialId])
+  @@map("punto_extra")
+}
+
+model Acta {
+  id                    String    @id @default(uuid())
+  cursoId               String    @map("curso_id")
+  version               Int
+  generadaEn            DateTime  @default(now()) @map("generada_en")
+  firmadaDocenteEn      DateTime? @map("firmada_docente_en")
+  firmadaCoordinacionEn DateTime? @map("firmada_coordinacion_en")
+  hashPdf               String?   @map("hash_pdf")
+  urlAlmacenamiento     String?   @map("url_almacenamiento")
+
+  curso                 Curso     @relation(fields: [cursoId], references: [id])
+
+  // Versionada: cada reapertura genera nueva versión (RN-06).
+  @@unique([cursoId, version])
+  @@map("acta")
+}
+
+// ─────────────────────────── Auditoría (append-only) ───────────────────────────
+
+model AuditLog {
+  id              String   @id @default(uuid())
+  timestamp       DateTime @default(now())
+  usuarioId       String?  @map("usuario_id")
+  ip              String?
+  tipoEvento      String   @map("tipo_evento")
+  entidad         String
+  entidadId       String?  @map("entidad_id")
+  valorAnteriorJson Json?  @map("valor_anterior_json")
+  valorNuevoJson  Json?    @map("valor_nuevo_json")
+
+  // Append-only: trigger en migración rechaza UPDATE/DELETE. Retención ≥5 años (política).
+  @@index([entidad, entidadId])
+  @@index([usuarioId])
+  @@map("audit_log")
+}
+
+model WorkflowEvent {
+  id        String   @id @default(uuid())
+  parcialId String   @map("parcial_id")
+  accion    String   // cerrar | validar | reabrir | devolver
+  usuarioId String   @map("usuario_id")
+  motivo    String?
+  timestamp DateTime @default(now())
+
+  parcial   Parcial  @relation(fields: [parcialId], references: [id])
+
+  // Append-only: trigger en migración rechaza UPDATE/DELETE.
+  @@index([parcialId])
+  @@map("workflow_event")
+}
