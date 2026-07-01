@@ -149,3 +149,21 @@ describe('AuditLog: append-only', () => {
     ).rejects.toThrow();
   });
 });
+
+describe('WorkflowEvent: append-only', () => {
+  it('rechaza UPDATE y DELETE sobre workflow_event', async () => {
+    const { curso } = await makeCurso();
+    const parcial = await prisma.parcial.create({
+      data: { cursoId: curso.id, numero: 1, pesoTI: 0.3, pesoTE: 0.3, pesoTA: 0.1, pesoEX: 0.3 },
+    });
+    const row = await prisma.workflowEvent.create({
+      data: { parcialId: parcial.id, accion: 'cerrar', usuarioId: 'x' },
+    });
+    await expect(
+      prisma.$executeRawUnsafe(`UPDATE workflow_event SET accion = 'hack' WHERE id = $1`, row.id),
+    ).rejects.toThrow();
+    await expect(
+      prisma.$executeRawUnsafe(`DELETE FROM workflow_event WHERE id = $1`, row.id),
+    ).rejects.toThrow();
+  });
+});

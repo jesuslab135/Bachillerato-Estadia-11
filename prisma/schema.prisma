@@ -191,6 +191,8 @@ model Parcial {
   pesoEX      Decimal       @map("peso_ex") @db.Decimal(4, 3)
   fechaInicio DateTime?     @map("fecha_inicio") @db.Date
   fechaFin    DateTime?     @map("fecha_fin") @db.Date
+  // Inicio del periodo de cierre: cerrar() se bloquea antes de esta fecha (RF-WF-02). Null ⇒ sin restricción.
+  fechaAperturaCierre DateTime? @map("fecha_apertura_cierre") @db.Date
 
   curso       Curso         @relation(fields: [cursoId], references: [id])
   criterios   Criterio[]

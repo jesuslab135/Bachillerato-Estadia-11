@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
-import { JwtModule } from '@nestjs/jwt';
+import { JwtModule, JwtSignOptions } from '@nestjs/jwt';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
@@ -14,7 +14,8 @@ import { RolesGuard } from './guards/roles.guard';
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
         secret: config.get<string>('JWT_SECRET') ?? 'dev-secret',
-        signOptions: { expiresIn: config.get<string>('JWT_EXPIRES_IN') ?? '8h' },
+        // El valor viene de config como string (p. ej. "8h"); JwtModule espera number | ms.StringValue.
+        signOptions: { expiresIn: (config.get<string>('JWT_EXPIRES_IN') ?? '8h') as JwtSignOptions['expiresIn'] },
       }),
     }),
   ],

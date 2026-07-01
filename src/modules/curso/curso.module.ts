@@ -9,6 +9,8 @@ import {
   Injectable,
   Module,
   NotFoundException,
+  Param,
+  Patch,
   Post,
 } from '@nestjs/common';
 import { IsString, MinLength } from 'class-validator';
@@ -48,6 +50,11 @@ class CreateCursoDto {
   @IsString() @MinLength(1) periodoId!: string;
 }
 
+class ReasignarDocenteDto {
+  @IsString() @MinLength(1) docenteId!: string;
+  @IsString() @MinLength(1) motivo!: string;
+}
+
 @Injectable()
 export class CursoService {
   constructor(private readonly prisma: PrismaService) {}
@@ -57,6 +64,29 @@ export class CursoService {
       where: { grupo: filtroPlantel(user) },
       include: { materia: true, grupo: true, periodo: true },
     });
+  }
+
+  private async cursoConAcceso(user: JwtPayload, cursoId: string) {
+    const curso = await this.prisma.curso.findUnique({ where: { id: cursoId }, include: { grupo: true } });
+    if (!curso) throw new NotFoundException('Curso no existe');
+    aseguraAccesoPlantel(user, curso.grupo.plantelId);
+    return curso;
+  }
+
+  async listarParciales(user: JwtPayload, cursoId: string) {
+    await this.cursoConAcceso(user, cursoId);
+    const parciales = await this.prisma.parcial.findMany({ where: { cursoId }, orderBy: { numero: 'asc' } });
+    return parciales.map((p) => ({
+      numero: p.numero,
+      estado: p.estado,
+      pesoTI: Number(p.pesoTI),
+      pesoTE: Number(p.pesoTE),
+      pesoTA: Number(p.pesoTA),
+      pesoEX: Number(p.pesoEX),
+      fechaInicio: p.fechaInicio,
+      fechaFin: p.fechaFin,
+      fechaAperturaCierre: p.fechaAperturaCierre,
+    }));
   }
 
   async crear(user: JwtPayload, dto: CreateCursoDto) {
@@ -135,6 +165,32 @@ export class CursoService {
       throw e;
     }
   }
+
+  /** RF-ASIG-02 — Reasigna el docente con motivo y timestamp; preserva los datos del curso. */
+  async reasignarDocente(user: JwtPayload, cursoId: string, dto: ReasignarDocenteDto) {
+    const curso = await this.prisma.curso.findUnique({ where: { id: cursoId }, include: { grupo: true } });
+    if (!curso) throw new NotFoundException('Curso no existe');
+    aseguraAccesoPlantel(user, curso.grupo.plantelId);
+
+    const docente = await this.prisma.usuario.findUnique({ where: { id: dto.docenteId } });
+    if (!docente || docente.rol !== 'Docente') throw new BadRequestException('El docente indicado no existe');
+    if (docente.plantelId !== curso.grupo.plantelId) throw new BadRequestException('El docente pertenece a otro plantel');
+
+    await this.prisma.$transaction([
+      this.prisma.curso.update({ where: { id: cursoId }, data: { docenteId: dto.docenteId } }),
+      this.prisma.auditLog.create({
+        data: {
+          tipoEvento: 'REASIGNAR_DOCENTE',
+          usuarioId: user.sub,
+          entidad: 'Curso',
+          entidadId: cursoId,
+          valorAnteriorJson: { docenteId: curso.docenteId },
+          valorNuevoJson: { docenteId: dto.docenteId, motivo: dto.motivo },
+        },
+      }),
+    ]);
+    return { docenteId: dto.docenteId };
+  }
 }
 
 @Controller('cursos')
@@ -146,11 +202,22 @@ export class CursoController {
     return this.cursos.findAll(user);
   }
 
+  @Get(':cursoId/parciales')
+  listarParciales(@CurrentUser() user: JwtPayload, @Param('cursoId') cursoId: string) {
+    return this.cursos.listarParciales(user, cursoId);
+  }
+
   @Roles('Coordinador', 'Operador')
   @Post()
   @HttpCode(HttpStatus.CREATED)
   create(@CurrentUser() user: JwtPayload, @Body() dto: CreateCursoDto) {
     return this.cursos.crear(user, dto);
+  }
+
+  @Roles('Coordinador', 'Operador')
+  @Patch(':cursoId/docente')
+  reasignarDocente(@CurrentUser() user: JwtPayload, @Param('cursoId') cursoId: string, @Body() dto: ReasignarDocenteDto) {
+    return this.cursos.reasignarDocente(user, cursoId, dto);
   }
 }
 
