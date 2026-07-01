@@ -16,6 +16,7 @@ npm install
 npm run db:up               # levanta Postgres 15 en localhost:5433
 npm run prisma:deploy       # aplica migraciones
 npm run seed                # 2 planteles + 33 materias + roles base
+npm run seed:test           # opcional: limpia la DB y siembra datos de prueba end-to-end
 npm test                    # Vitest: pruebas de restricciones del modelo (§3.6 del plan)
 ```
 
@@ -141,10 +142,15 @@ revalidación crea una nueva versión (RN-06).
 | GET | `/api/cadetes/:matricula` | uno (404/403 según scope) |
 | POST | `/api/cadetes` | crea `{matricula,nombreCompleto,grupoId,estatus?}` |
 | PATCH | `/api/cadetes/:matricula` | actualiza nombre/grupo/estatus; RN-05 sella `fechaBaja` en baja |
-| POST | `/api/cadetes/import` | `{registros:[…]}` o `{csv}`; éxito parcial + dedup (DB y lote), reporta `{insertados, errores[]}` (RF-CAT-07) |
+| POST | `/api/cadetes/import` | `{registros:[…]}` o `{csv}` (texto) + `grupoIdPorDefecto?`; éxito parcial + dedup (DB y lote), reporta `{insertados, errores[]}` (RF-CAT-07) |
+| POST | `/api/cadetes/import/archivo` | multipart `archivo` (`.csv`/`.xlsx` ≤ 2 MB) + `?grupoId=` opcional (grupo por defecto); misma lógica de import (RF-CAT-07) |
 
-> XLSX: el import procesa `registros` ya parseados o CSV (sin dependencias); el parseo de
-> archivos `.xlsx` es un adaptador SheetJS pendiente.
+> `grupoIdPorDefecto` / `?grupoId=` se aplica a las filas **sin** `grupoId`; si la fila trae su
+> propio `grupoId`, ese tiene prioridad (retrocompatible).
+
+> El import por archivo usa `FileInterceptor` (Multer, incluido en `@nestjs/platform-express`)
+> y **SheetJS (`xlsx`)** para `.xlsx`; el CSV se parsea sin dependencias. Se instala con
+> `npm install`. El endpoint de texto (`{registros}`/`{csv}`) se conserva.
 
 **Panel del docente** (RF-ASIG-04): `GET /api/docente/panel` → por curso del docente
 autenticado: asistencia de hoy (capturada + conteo), parciales abiertos, cierres próximos (7 días).

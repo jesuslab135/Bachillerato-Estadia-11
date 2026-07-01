@@ -13,13 +13,28 @@ import {
   Patch,
   Post,
   Query,
+  UploadedFile,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import * as XLSX from 'xlsx';
 import { IsArray, IsIn, IsOptional, IsString, MinLength } from 'class-validator';
 import { EstatusCadete } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CurrentUser, Roles } from '../../auth/decorators';
 import { JwtPayload } from '../../auth/auth.types';
 import { aseguraAccesoPlantel, filtroPlantel } from '../../common/scope';
+
+// Límite de tamaño para importación por archivo (FB-B-1). 2 MB es de sobra para un roster.
+const MAX_IMPORT_BYTES = 2 * 1024 * 1024;
+
+// Archivo subido (subconjunto de Express.Multer.File; evita depender de @types/multer).
+interface ArchivoSubido {
+  originalname: string;
+  buffer: Buffer;
+  size: number;
+  mimetype: string;
+}
 
 const ESTATUS: EstatusCadete[] = ['Activo', 'BajaTemporal', 'BajaDefinitiva'];
 const CON_FECHA_BAJA: EstatusCadete[] = ['BajaTemporal', 'BajaDefinitiva'];
@@ -47,6 +62,8 @@ class ActualizarCadeteDto {
 class ImportCadetesDto {
   @IsOptional() @IsArray() registros?: RegistroImport[];
   @IsOptional() @IsString() csv?: string;
+  // FB-B-2 — grupo aplicado a las filas SIN grupoId (la fila con grupoId propio tiene prioridad).
+  @IsOptional() @IsString() grupoIdPorDefecto?: string;
 }
 
 interface ErrorImport {
@@ -127,7 +144,8 @@ export class CadeteService {
   /** RF-CAT-07 — Importación con éxito parcial: valida por fila y no aborta las válidas. */
   async importar(user: JwtPayload, dto: ImportCadetesDto) {
     const registros = dto.registros ?? (dto.csv ? this.parseCsv(dto.csv) : []);
-    const grupoIds = [...new Set(registros.map((r) => r.grupoId).filter((g): g is string => !!g))];
+    const idsSolicitados = [...registros.map((r) => r.grupoId?.trim()), dto.grupoIdPorDefecto];
+    const grupoIds = [...new Set(idsSolicitados.filter((g): g is string => !!g))];
     const grupos = new Map(
       (await this.prisma.grupo.findMany({ where: { id: { in: grupoIds } } })).map((g) => [g.id, g]),
     );
@@ -142,10 +160,11 @@ export class CadeteService {
 
     registros.forEach((r, indice) => {
       const matricula = r.matricula?.trim() || null;
+      const grupoId = r.grupoId?.trim() || dto.grupoIdPorDefecto; // la fila gana; si no, el grupo por defecto
       const push = (motivo: string) => errores.push({ indice, matricula, motivo });
-      if (!matricula || !r.nombreCompleto?.trim() || !r.grupoId) return push('Campos requeridos: matricula, nombreCompleto, grupoId');
+      if (!matricula || !r.nombreCompleto?.trim() || !grupoId) return push('Campos requeridos: matricula, nombreCompleto, grupo');
       if (existentes.has(matricula) || enLote.has(matricula)) return push('Matrícula duplicada');
-      const grupo = grupos.get(r.grupoId);
+      const grupo = grupos.get(grupoId);
       if (!grupo) return push('Grupo inexistente');
       if (user.rol !== 'Operador' && grupo.plantelId !== user.plantelId) return push('Grupo de otro plantel');
       const estatus = (r.estatus?.trim() as EstatusCadete) || 'Activo';
@@ -160,6 +179,34 @@ export class CadeteService {
       });
     }
     return { insertados: validos.length, errores };
+  }
+
+  private parseXlsx(buffer: Buffer): RegistroImport[] {
+    const wb = XLSX.read(buffer, { type: 'buffer' });
+    const hoja = wb.Sheets[wb.SheetNames[0]];
+    if (!hoja) return [];
+    const filas = XLSX.utils.sheet_to_json<Record<string, unknown>>(hoja, { defval: '' });
+    const txt = (v: unknown) => (v === null || v === undefined ? '' : String(v).trim());
+    return filas.map((f) => ({
+      matricula: txt(f.matricula),
+      nombreCompleto: txt(f.nombreCompleto),
+      grupoId: txt(f.grupoId),
+      estatus: txt(f.estatus) || undefined,
+    }));
+  }
+
+  /** RF-CAT-07 — Importación desde archivo subido (.csv o .xlsx), reutiliza `importar`. */
+  async importarArchivo(user: JwtPayload, file: ArchivoSubido | undefined, grupoIdPorDefecto?: string) {
+    if (!file) throw new BadRequestException('Archivo requerido (campo "archivo")');
+    if (file.size > MAX_IMPORT_BYTES) throw new BadRequestException('El archivo excede 2 MB');
+    const nombre = file.originalname.toLowerCase();
+    if (nombre.endsWith('.csv')) {
+      return this.importar(user, { csv: file.buffer.toString('utf-8'), grupoIdPorDefecto });
+    }
+    if (nombre.endsWith('.xlsx')) {
+      return this.importar(user, { registros: this.parseXlsx(file.buffer), grupoIdPorDefecto });
+    }
+    throw new BadRequestException('Formato no soportado: usa un archivo .csv o .xlsx');
   }
 }
 
@@ -190,6 +237,14 @@ export class CadeteController {
   @HttpCode(HttpStatus.CREATED)
   importar(@CurrentUser() user: JwtPayload, @Body() dto: ImportCadetesDto) {
     return this.cadetes.importar(user, dto);
+  }
+
+  @Roles('Coordinador', 'Operador')
+  @Post('import/archivo')
+  @HttpCode(HttpStatus.CREATED)
+  @UseInterceptors(FileInterceptor('archivo'))
+  importarArchivo(@CurrentUser() user: JwtPayload, @UploadedFile() file: ArchivoSubido, @Query('grupoId') grupoId?: string) {
+    return this.cadetes.importarArchivo(user, file, grupoId);
   }
 
   @Roles('Coordinador', 'Operador')
