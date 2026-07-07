@@ -17,8 +17,17 @@ npm run db:up               # levanta Postgres 15 en localhost:5433
 npm run prisma:deploy       # aplica migraciones
 npm run seed                # 2 planteles + 33 materias + roles base
 npm run seed:test           # opcional: limpia la DB y siembra datos de prueba end-to-end
-npm test                    # Vitest: pruebas de restricciones del modelo (§3.6 del plan)
+npm test                    # Vitest: dominio + integridad del modelo + e2e (requiere la DB arriba)
+npm run lint                # ESLint 9 (flat config, typescript-eslint) — FB-B-10
 ```
+
+> **`JWT_SECRET` es obligatorio**: el proceso (y las pruebas e2e) no arrancan sin él
+> (fail-fast, FB-B-5). Ya viene definido en `.env.example`.
+
+> La dependencia `xlsx` se instala desde el **tarball oficial de SheetJS**
+> (`https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz`, fijado en `package.json`) porque
+> npm público solo publica hasta 0.18.5 (con CVE-2023-30533 / CVE-2024-22363). `npm install`
+> lo resuelve solo; no hay pasos manuales.
 
 ## Arrancar la API
 ```powershell
@@ -72,7 +81,10 @@ Todo acotado por plantel (RF-AUTH-03): Docente/Coordinador solo ven su plantel; 
 > SDE (RN-01) se recalcula en cada lectura sobre la ventana de fechas del parcial;
 > cambiar `F`→`J` restituye el derecho automáticamente (RF-ASIS-08). Se valida: código
 > A/F/R/J, que el cadete pertenezca al grupo del curso, y que no esté en baja definitiva
-> (RN-05). Todo acotado por plantel (RF-AUTH-03).
+> (RN-05). Todo acotado por plantel (RF-AUTH-03). **RN-06 (FB-B-3):** si la fecha cae en la
+> ventana de un parcial `CerradoDocente`/`Validado`, la captura responde **409** (asistencia
+> inmutable; requiere reapertura formal). Los cambios de código (p. ej. `F`→`J`) dejan
+> rastro en `audit_log` (FB-B-9).
 > **Pendiente**: captura offline/PWA (RF-ASIS-06) y gestión de Cadetes (CRUD) — por ahora
 > los cadetes se crean directamente; su módulo llega con import (RF-CAT-07).
 
@@ -117,15 +129,17 @@ escribe `WorkflowEvent` + `AuditLog` (usuario, IP, estado anterior/nuevo) de for
 
 ## API de acta semestral (I8)
 Acta derivada del curso: cascada RN-04, recuperaciones, doble firma y hash de integridad.
-El acta se genera al validar el 3er parcial (con 1 y 2 ya validados); cada reapertura +
-revalidación crea una nueva versión (RN-06).
+El acta se genera al validar **cualquier** parcial que deje los 3 en `Validado` (cualquier
+orden de validación, FB-B-4), dentro de la misma transacción que el cambio de estado; cada
+reapertura + revalidación crea una nueva versión (RN-06). El hash SHA-256 se calcula y
+persiste al **generar** y al **firmar** (FB-B-9); `GET /acta/export` es de solo lectura.
 
 | Método | Ruta | Rol | Notas |
 |---|---|---|---|
 | GET | `/api/cursos/:id/acta` | autenticado | vista vigente: por cadete `[f1,f2,f3]`, recuperaciones, observación, calif. final (RN-04); 404 si no generada |
 | POST | `/api/cursos/:id/acta/recuperacion` | Docente/Coord/Op | `{cadeteMatricula, tipo, valor\|np}`; elegibilidad por observación (Ordinario/Extraordinario/TDS, RF-ACTA-03/04) |
 | POST | `/api/cursos/:id/acta/firmar` | Docente / Coord | Docente→`firmadaDocenteEn`, Coordinación→`firmadaCoordinacionEn` (RF-ACTA-06); Operador no firma |
-| GET | `/api/cursos/:id/acta/export` | autenticado | documento canónico + hash SHA-256 (persistido en `hashPdf`, RF-ACTA-07) |
+| GET | `/api/cursos/:id/acta/export` | autenticado | documento canónico + hash SHA-256 **persistido** (`hashPdf` fijado al generar/firmar; el GET no muta — FB-B-9) |
 
 > La calif. final por cadete reutiliza el `calculo` de los 3 parciales (I6) y la cascada
 > pura `domain/semestre.ts` (RN-04, 100% cubierta). Las recuperaciones se guardan como
@@ -159,12 +173,23 @@ autenticado: asistencia de hoy (capturada + conteo), parciales abiertos, cierres
 (Coord/Op) — valida mismo plantel, registra en `audit_log` (`REASIGNAR_DOCENTE`, valor
 anterior/nuevo + motivo) y preserva asistencias/calificaciones (referencian al curso, no al docente).
 
-## Seguridad (I10, RNF-SEC)
+## Seguridad (I10, RNF-SEC + FB-B-5/6)
+- **JWT fail-fast** — sin `JWT_SECRET` el proceso no arranca (no hay secreto por defecto).
 - **Helmet** — cabeceras de seguridad en todas las respuestas (nosniff, frameguard, oculta
   `x-powered-by`, etc.).
-- **CORS** — restringible por `CORS_ORIGIN` (lista separada por comas; vacío refleja el origen).
-- **Rate-limit** (`@nestjs/throttler`) — por IP, `THROTTLE_LIMIT`/`THROTTLE_TTL` (default 1000/60s);
-  complementa el bloqueo por usuario del login (RF-AUTH-05).
+- **CORS** — allowlist por `CORS_ORIGIN` (lista separada por comas, saneada). Sin valor:
+  en **producción** (`NODE_ENV=production`) no se refleja ningún origen (CORS deshabilitado);
+  en desarrollo se mantiene el modo permisivo.
+- **Rate-limit** (`@nestjs/throttler`) — global por IP (`THROTTLE_LIMIT`/`THROTTLE_TTL`,
+  default 1000/60s) **más** un límite propio de `POST /auth/login`
+  (`THROTTLE_LOGIN_LIMIT`/`THROTTLE_LOGIN_TTL`, default 10/60s; en dev/test se deja en 30
+  porque los e2e hacen varios logins reales). Complementa el bloqueo por usuario (RF-AUTH-05).
+- **Uploads** — `FileInterceptor` con `limits.fileSize` (2 MB) y verificación de **magic
+  bytes**: un `.xlsx` debe empezar con `PK\x03\x04` y un `.csv` debe ser texto plano.
+- **Autorización fina (FB-B-6)** — un Docente solo **escribe** en sus propios cursos
+  (asistencia, calificaciones, examen, punto extra, cerrar, firmar, recuperación → 403 si
+  no es el titular); bitácora y desbloqueo scoped por plantel para Coordinador (Operador global);
+  crear curso valida que el docente tenga rol `Docente` y pertenezca al plantel del grupo.
 - Config compartida en `src/app.setup.ts` (`configurarApp`) usada por `main.ts` y las pruebas e2e.
 - TLS 1.3 y cifrado at-rest (RNF-SEC-01/02) son responsabilidad del despliegue (reverse proxy + DB).
 

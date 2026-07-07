@@ -2,7 +2,6 @@ import {
   BadRequestException,
   Body,
   Controller,
-  ForbiddenException,
   Get,
   HttpCode,
   HttpStatus,
@@ -24,9 +23,23 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { CurrentUser, Roles } from '../../auth/decorators';
 import { JwtPayload } from '../../auth/auth.types';
 import { aseguraAccesoPlantel, filtroPlantel } from '../../common/scope';
+import { parseCsv } from '../../common/csv';
 
 // Límite de tamaño para importación por archivo (FB-B-1). 2 MB es de sobra para un roster.
 const MAX_IMPORT_BYTES = 2 * 1024 * 1024;
+
+// FB-B-5 — verificación por firma (magic bytes), no solo por extensión.
+const FIRMA_ZIP = [0x50, 0x4b, 0x03, 0x04]; // "PK\x03\x04": contenedor ZIP de un .xlsx
+
+/** Un .xlsx real es un ZIP: debe empezar con la firma PK\x03\x04. */
+function tieneFirmaXlsx(buffer: Buffer): boolean {
+  return buffer.length >= FIRMA_ZIP.length && FIRMA_ZIP.every((b, i) => buffer[i] === b);
+}
+
+/** Un .csv debe ser texto: se rechaza contenido con bytes NUL (binario). */
+function esTextoPlano(buffer: Buffer): boolean {
+  return !buffer.subarray(0, 1024).includes(0);
+}
 
 // Archivo subido (subconjunto de Express.Multer.File; evita depender de @types/multer).
 interface ArchivoSubido {
@@ -129,21 +142,10 @@ export class CadeteService {
     });
   }
 
-  private parseCsv(csv: string): RegistroImport[] {
-    const lineas = csv.split(/\r?\n/).filter((l) => l.trim().length > 0);
-    if (lineas.length === 0) return [];
-    const cols = lineas[0].split(',').map((c) => c.trim());
-    return lineas.slice(1).map((linea) => {
-      const celdas = linea.split(',');
-      const fila: RegistroImport = {};
-      cols.forEach((col, i) => ((fila as Record<string, string>)[col] = (celdas[i] ?? '').trim()));
-      return fila;
-    });
-  }
-
   /** RF-CAT-07 — Importación con éxito parcial: valida por fila y no aborta las válidas. */
   async importar(user: JwtPayload, dto: ImportCadetesDto) {
-    const registros = dto.registros ?? (dto.csv ? this.parseCsv(dto.csv) : []);
+    // FB-B-7: parser RFC 4180 compartido (comas dentro de comillas, comillas escapadas).
+    const registros = dto.registros ?? (dto.csv ? (parseCsv(dto.csv) as RegistroImport[]) : []);
     const idsSolicitados = [...registros.map((r) => r.grupoId?.trim()), dto.grupoIdPorDefecto];
     const grupoIds = [...new Set(idsSolicitados.filter((g): g is string => !!g))];
     const grupos = new Map(
@@ -201,9 +203,14 @@ export class CadeteService {
     if (file.size > MAX_IMPORT_BYTES) throw new BadRequestException('El archivo excede 2 MB');
     const nombre = file.originalname.toLowerCase();
     if (nombre.endsWith('.csv')) {
+      // FB-B-5: la extensión filtra primero; la firma del contenido decide (no se parsea binario).
+      if (!esTextoPlano(file.buffer)) throw new BadRequestException('El archivo .csv no es texto plano');
       return this.importar(user, { csv: file.buffer.toString('utf-8'), grupoIdPorDefecto });
     }
     if (nombre.endsWith('.xlsx')) {
+      if (!tieneFirmaXlsx(file.buffer)) {
+        throw new BadRequestException('El archivo no tiene la firma de un .xlsx válido');
+      }
       return this.importar(user, { registros: this.parseXlsx(file.buffer), grupoIdPorDefecto });
     }
     throw new BadRequestException('Formato no soportado: usa un archivo .csv o .xlsx');
@@ -242,7 +249,8 @@ export class CadeteController {
   @Roles('Coordinador', 'Operador')
   @Post('import/archivo')
   @HttpCode(HttpStatus.CREATED)
-  @UseInterceptors(FileInterceptor('archivo'))
+  // FB-B-5: multer corta el stream en el límite (no se bufferea un archivo mayor).
+  @UseInterceptors(FileInterceptor('archivo', { limits: { fileSize: MAX_IMPORT_BYTES } }))
   importarArchivo(@CurrentUser() user: JwtPayload, @UploadedFile() file: ArchivoSubido, @Query('grupoId') grupoId?: string) {
     return this.cadetes.importarArchivo(user, file, grupoId);
   }

@@ -1,4 +1,4 @@
-import { HttpException, HttpStatus, Injectable, UnauthorizedException } from '@nestjs/common';
+import { ForbiddenException, HttpException, HttpStatus, Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { Usuario } from '@prisma/client';
@@ -66,16 +66,18 @@ export class AuthService {
 
     const ok = await bcrypt.compare(password, user.hashContrasena);
     if (!ok) {
-      const intentos = user.intentosFallidos + 1;
-      const alcanzaTope = intentos >= this.maxIntentos;
-      await this.prisma.usuario.update({
+      // FB-B-9 — incremento atómico: dos fallos concurrentes suman 2 (sin read-modify-write).
+      const actualizado = await this.prisma.usuario.update({
         where: { id: user.id },
-        data: {
-          intentosFallidos: intentos,
-          bloqueadoHasta: alcanzaTope ? new Date(Date.now() + this.bloqueoMs) : user.bloqueadoHasta,
-        },
+        data: { intentosFallidos: { increment: 1 } },
       });
-      await this.auditar('LOGIN_FALLIDO', ip, user.id, { email, intentos });
+      if (actualizado.intentosFallidos >= this.maxIntentos) {
+        await this.prisma.usuario.update({
+          where: { id: user.id },
+          data: { bloqueadoHasta: new Date(Date.now() + this.bloqueoMs) },
+        });
+      }
+      await this.auditar('LOGIN_FALLIDO', ip, user.id, { email, intentos: actualizado.intentosFallidos });
       throw new UnauthorizedException('Credenciales inválidas');
     }
 
@@ -104,14 +106,18 @@ export class AuthService {
   }
 
   // RF-AUTH-05 — Coordinador/Operador desbloquea una cuenta.
-  async desbloquear(email: string, ejecutorId: string): Promise<{ desbloqueado: boolean }> {
+  // FB-B-6 — scoping: un Coordinador solo desbloquea usuarios de su propio plantel.
+  async desbloquear(email: string, ejecutor: JwtPayload): Promise<{ desbloqueado: boolean }> {
     const user = await this.prisma.usuario.findUnique({ where: { email } });
     if (!user) throw new UnauthorizedException('Usuario no existe');
+    if (ejecutor.rol !== 'Operador' && ejecutor.plantelId !== user.plantelId) {
+      throw new ForbiddenException('No tiene acceso a usuarios de otro plantel');
+    }
     await this.prisma.usuario.update({
       where: { id: user.id },
       data: { intentosFallidos: 0, bloqueadoHasta: null },
     });
-    await this.auditar('DESBLOQUEO', null, user.id, { por: ejecutorId });
+    await this.auditar('DESBLOQUEO', null, user.id, { por: ejecutor.sub });
     return { desbloqueado: true };
   }
 }

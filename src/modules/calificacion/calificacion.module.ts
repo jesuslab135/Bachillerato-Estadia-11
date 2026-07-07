@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   Get,
   HttpCode,
@@ -26,11 +27,12 @@ import {
   MinLength,
   ValidateNested,
 } from 'class-validator';
-import { EstadoParcial, Prisma, TipoCategoria } from '@prisma/client';
+import { Prisma, TipoCategoria } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CurrentUser, Roles } from '../../auth/decorators';
 import { JwtPayload } from '../../auth/auth.types';
-import { aseguraAccesoPlantel } from '../../common/scope';
+import { aseguraAccesoPlantel, aseguraEscrituraDocente } from '../../common/scope';
+import { ESTADOS_BLOQUEADOS, ventanaDeParcial } from '../../common/parcial';
 import {
   CALIF_MAX,
   CALIF_MIN,
@@ -48,8 +50,6 @@ import {
 
 const TIPOS: TipoCategoria[] = ['TI', 'TE', 'TA'];
 const MAX_ACTIVIDADES_POR_TIPO = 30;
-// Estados no editables: la reapertura formal de un parcial validado es I7 (RN-06).
-const ESTADOS_BLOQUEADOS: EstadoParcial[] = ['CerradoDocente', 'Validado'];
 
 const macroDe = (pesos: PesosParcial, tipo: TipoCategoria): number =>
   tipo === 'TI' ? pesos.ti : tipo === 'TE' ? pesos.te : pesos.ta;
@@ -127,14 +127,24 @@ export class CalificacionService {
     return curso;
   }
 
+  /** Guard de ESCRITURA: acceso por plantel + propiedad del curso (FB-B-6) + estado editable. */
   private async parcialEditable(user: JwtPayload, cursoId: string, numero: number) {
     const curso = await this.cursoConAcceso(user, cursoId);
+    aseguraEscrituraDocente(user, curso.docenteId);
     if (![1, 2, 3].includes(numero)) throw new BadRequestException('Parcial debe ser 1, 2 o 3');
     const parcial = await this.prisma.parcial.findUniqueOrThrow({ where: { cursoId_numero: { cursoId, numero } } });
     if (ESTADOS_BLOQUEADOS.includes(parcial.estado)) {
       throw new BadRequestException(`El parcial está ${parcial.estado} y es inmutable (requiere reapertura formal)`);
     }
     return { curso, parcial };
+  }
+
+  /** FB-B-3 — Re-aserción del estado DENTRO de la transacción (evita TOCTOU con cerrar/validar). */
+  private async asegurarParcialEditableEnTx(tx: Prisma.TransactionClient, parcialId: string) {
+    const actual = await tx.parcial.findUniqueOrThrow({ where: { id: parcialId }, select: { estado: true } });
+    if (ESTADOS_BLOQUEADOS.includes(actual.estado)) {
+      throw new ConflictException('El parcial fue cerrado o validado durante la captura: es inmutable (RN-06)');
+    }
   }
 
   private async validaCadeteCapturable(matricula: string, grupoId: string) {
@@ -147,10 +157,11 @@ export class CalificacionService {
   }
 
   /** Faltas no justificadas (código F) por cadete dentro de la ventana del parcial (RN-01). */
-  private async faltasEnParcial(cursoId: string, parcial: { fechaInicio: Date | null; fechaFin: Date | null }) {
+  private async faltasEnParcial(cursoId: string, parcial: { numero: number; fechaInicio: Date | null; fechaFin: Date | null }) {
+    const ventana = ventanaDeParcial(parcial); // FB-B-7: 409 si la ventana es nula
     const filas = await this.prisma.asistencia.groupBy({
       by: ['cadeteMatricula'],
-      where: { cursoId, codigo: 'F', fecha: { gte: parcial.fechaInicio!, lte: parcial.fechaFin! } },
+      where: { cursoId, codigo: 'F', fecha: { gte: ventana.inicio, lte: ventana.fin } },
       _count: { _all: true },
     });
     return new Map(filas.map((f) => [f.cadeteMatricula, f._count._all]));
@@ -225,25 +236,41 @@ export class CalificacionService {
   /** RF-CAL-01 — Crea una actividad; bloquea la 31ª de una categoría. */
   async crearActividad(user: JwtPayload, cursoId: string, numero: number, dto: CrearActividadDto) {
     const { parcial } = await this.parcialEditable(user, cursoId, numero);
+    // FB-B-7 — el criterio referenciado debe pertenecer a ESTE parcial.
+    if (dto.criterioId) {
+      const criterio = await this.prisma.criterio.findUnique({ where: { id: dto.criterioId } });
+      if (!criterio || criterio.parcialId !== parcial.id) {
+        throw new BadRequestException('El criterioId indicado no pertenece a este parcial');
+      }
+    }
     const usadas = await this.prisma.actividad.count({ where: { parcialId: parcial.id, tipo: dto.tipo } });
     if (usadas >= MAX_ACTIVIDADES_POR_TIPO) {
       throw new BadRequestException(`Máximo ${MAX_ACTIVIDADES_POR_TIPO} actividades por categoría (RF-CAL-01)`);
     }
-    return this.prisma.actividad.create({
-      data: {
-        parcialId: parcial.id,
-        tipo: dto.tipo,
-        orden: usadas + 1,
-        nombre: dto.nombre,
-        fecha: dto.fecha ? new Date(dto.fecha) : null,
-        criterioId: dto.criterioId ?? null,
-      },
-    });
+    try {
+      return await this.prisma.actividad.create({
+        data: {
+          parcialId: parcial.id,
+          tipo: dto.tipo,
+          orden: usadas + 1,
+          nombre: dto.nombre,
+          fecha: dto.fecha ? new Date(dto.fecha) : null,
+          criterioId: dto.criterioId ?? null,
+        },
+      });
+    } catch (e) {
+      // FB-B-9 — count-then-create bajo concurrencia: el unique (parcial,tipo,orden) colisiona.
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        throw new ConflictException('Otra actividad tomó ese orden al mismo tiempo: reintente la creación');
+      }
+      throw e;
+    }
   }
 
   /** RF-CAL-03/04 — Captura masiva de calificaciones de una actividad. */
   async capturarCalificaciones(user: JwtPayload, cursoId: string, actividadId: string, dto: CapturarCalificacionesDto) {
     const curso = await this.cursoConAcceso(user, cursoId);
+    aseguraEscrituraDocente(user, curso.docenteId); // FB-B-6
     const actividad = await this.prisma.actividad.findUnique({ where: { id: actividadId }, include: { parcial: true } });
     if (!actividad || actividad.parcial.cursoId !== cursoId) throw new NotFoundException('Actividad no existe en este curso');
     if (ESTADOS_BLOQUEADOS.includes(actividad.parcial.estado)) {
@@ -252,15 +279,38 @@ export class CalificacionService {
 
     for (const r of dto.registros) await this.validaCadeteCapturable(r.cadeteMatricula, curso.grupoId);
 
-    await this.prisma.$transaction(
-      dto.registros.map((r) =>
-        this.prisma.calificacion.upsert({
+    await this.prisma.$transaction(async (tx) => {
+      await this.asegurarParcialEditableEnTx(tx, actividad.parcialId);
+      // FB-B-9 — captura nueva y edición real dejan rastro; el upsert idéntico no genera ruido.
+      const previas = new Map(
+        (
+          await tx.calificacion.findMany({
+            where: { actividadId, cadeteMatricula: { in: dto.registros.map((r) => r.cadeteMatricula) } },
+          })
+        ).map((c) => [c.cadeteMatricula, c]),
+      );
+      for (const r of dto.registros) {
+        const antes = previas.get(r.cadeteMatricula);
+        const valorAntes = antes?.valor === null || antes?.valor === undefined ? null : Number(antes.valor);
+        const fila = await tx.calificacion.upsert({
           where: { cadeteMatricula_actividadId: { cadeteMatricula: r.cadeteMatricula, actividadId } },
           create: { cadeteMatricula: r.cadeteMatricula, actividadId, valor: r.valor, capturadaPor: user.sub },
           update: { valor: r.valor, capturadaPor: user.sub, capturadaEn: new Date() },
-        }),
-      ),
-    );
+        });
+        if (!antes || valorAntes !== r.valor) {
+          await tx.auditLog.create({
+            data: {
+              tipoEvento: 'CALIFICACION_CAPTURA',
+              usuarioId: user.sub,
+              entidad: 'Calificacion',
+              entidadId: fila.id,
+              valorAnteriorJson: antes ? { valor: valorAntes } : undefined,
+              valorNuevoJson: { valor: r.valor, cadeteMatricula: r.cadeteMatricula, actividadId },
+            },
+          });
+        }
+      }
+    });
     return { capturados: dto.registros.length };
   }
 
@@ -281,17 +331,40 @@ export class CalificacionService {
       }
     }
 
-    await this.prisma.$transaction(
-      dto.registros.map((r) => {
+    await this.prisma.$transaction(async (tx) => {
+      await this.asegurarParcialEditableEnTx(tx, parcial.id);
+      // FB-B-9 — rastro de captura/edición del examen (sin ruido en upserts idénticos).
+      const previas = new Map(
+        (
+          await tx.examen.findMany({
+            where: { parcialId: parcial.id, tipo: 'Parcial', cadeteMatricula: { in: dto.registros.map((r) => r.cadeteMatricula) } },
+          })
+        ).map((e) => [e.cadeteMatricula, e]),
+      );
+      for (const r of dto.registros) {
         const esNP = r.np === true;
         const data = { valor: esNP ? null : r.valor!, estatus: esNP ? ('NP' as const) : ('PRESENTADO' as const), capturadoPor: user.sub };
-        return this.prisma.examen.upsert({
+        const antes = previas.get(r.cadeteMatricula);
+        const valorAntes = antes?.valor === null || antes?.valor === undefined ? null : Number(antes.valor);
+        const fila = await tx.examen.upsert({
           where: { cadeteMatricula_parcialId_tipo: { cadeteMatricula: r.cadeteMatricula, parcialId: parcial.id, tipo: 'Parcial' } },
           create: { cadeteMatricula: r.cadeteMatricula, parcialId: parcial.id, tipo: 'Parcial', ...data },
           update: data,
         });
-      }),
-    );
+        if (!antes || valorAntes !== data.valor || antes.estatus !== data.estatus) {
+          await tx.auditLog.create({
+            data: {
+              tipoEvento: 'EXAMEN_CAPTURA',
+              usuarioId: user.sub,
+              entidad: 'Examen',
+              entidadId: fila.id,
+              valorAnteriorJson: antes ? { valor: valorAntes, estatus: antes.estatus } : undefined,
+              valorNuevoJson: { valor: data.valor, estatus: data.estatus, cadeteMatricula: r.cadeteMatricula, parcialId: parcial.id },
+            },
+          });
+        }
+      }
+    });
     return { capturados: dto.registros.length };
   }
 
@@ -300,15 +373,38 @@ export class CalificacionService {
     const { curso, parcial } = await this.parcialEditable(user, cursoId, numero);
     for (const r of dto.registros) await this.validaCadeteCapturable(r.cadeteMatricula, curso.grupoId);
 
-    await this.prisma.$transaction(
-      dto.registros.map((r) =>
-        this.prisma.puntoExtra.upsert({
+    await this.prisma.$transaction(async (tx) => {
+      await this.asegurarParcialEditableEnTx(tx, parcial.id);
+      // FB-B-9 — rastro del punto extra solo cuando el valor cambia realmente.
+      const previas = new Map(
+        (
+          await tx.puntoExtra.findMany({
+            where: { parcialId: parcial.id, cadeteMatricula: { in: dto.registros.map((r) => r.cadeteMatricula) } },
+          })
+        ).map((p) => [p.cadeteMatricula, p]),
+      );
+      for (const r of dto.registros) {
+        const antes = previas.get(r.cadeteMatricula);
+        const motivoNuevo = r.motivo ?? null;
+        const fila = await tx.puntoExtra.upsert({
           where: { cadeteMatricula_parcialId: { cadeteMatricula: r.cadeteMatricula, parcialId: parcial.id } },
-          create: { cadeteMatricula: r.cadeteMatricula, parcialId: parcial.id, aplica: r.aplica, motivo: r.motivo ?? null },
-          update: { aplica: r.aplica, motivo: r.motivo ?? null },
-        }),
-      ),
-    );
+          create: { cadeteMatricula: r.cadeteMatricula, parcialId: parcial.id, aplica: r.aplica, motivo: motivoNuevo },
+          update: { aplica: r.aplica, motivo: motivoNuevo },
+        });
+        if (!antes || antes.aplica !== r.aplica || antes.motivo !== motivoNuevo) {
+          await tx.auditLog.create({
+            data: {
+              tipoEvento: 'PUNTO_EXTRA_CAPTURA',
+              usuarioId: user.sub,
+              entidad: 'PuntoExtra',
+              entidadId: fila.id,
+              valorAnteriorJson: antes ? { aplica: antes.aplica, motivo: antes.motivo } : undefined,
+              valorNuevoJson: { aplica: r.aplica, motivo: motivoNuevo, cadeteMatricula: r.cadeteMatricula, parcialId: parcial.id },
+            },
+          });
+        }
+      }
+    });
     return { actualizados: dto.registros.length };
   }
 

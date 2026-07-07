@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   Get,
   HttpCode,
@@ -14,11 +15,12 @@ import {
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import { ArrayMinSize, IsDateString, IsIn, IsString, MinLength, ValidateNested } from 'class-validator';
-import { CodigoAsistencia } from '@prisma/client';
+import { CodigoAsistencia, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CurrentUser, Roles } from '../../auth/decorators';
 import { JwtPayload } from '../../auth/auth.types';
-import { aseguraAccesoPlantel } from '../../common/scope';
+import { aseguraAccesoPlantel, aseguraEscrituraDocente } from '../../common/scope';
+import { ESTADOS_BLOQUEADOS, ventanaDeParcial } from '../../common/parcial';
 import { esSDE, porcentajeAsistencia, tieneDerechoExamen } from '../../domain';
 
 const CODIGOS: CodigoAsistencia[] = ['A', 'F', 'R', 'J'];
@@ -36,6 +38,11 @@ class CapturarAsistenciaDto {
   registros!: RegistroAsistenciaDto[];
 }
 
+// FB-B-7 — la fecha de consulta se valida con DTO (antes: Invalid Date → 500).
+class FechaQueryDto {
+  @IsDateString() fecha!: string;
+}
+
 @Injectable()
 export class AsistenciaService {
   constructor(private readonly prisma: PrismaService) {}
@@ -47,8 +54,26 @@ export class AsistenciaService {
     return curso;
   }
 
+  /**
+   * FB-B-3 / RN-06 — La asistencia cuya fecha cae en la ventana de un parcial
+   * CerradoDocente/Validado es inmutable (alterarla cambiaría SDE y el acta).
+   * Fechas fuera de toda ventana de parcial se permiten (comportamiento actual).
+   */
+  private async asegurarVentanaEditable(tx: Prisma.TransactionClient, cursoId: string, fecha: Date) {
+    const parcial = await tx.parcial.findFirst({
+      where: { cursoId, fechaInicio: { lte: fecha }, fechaFin: { gte: fecha } },
+      select: { numero: true, estado: true },
+    });
+    if (parcial && ESTADOS_BLOQUEADOS.includes(parcial.estado)) {
+      throw new ConflictException(
+        `La fecha cae en el parcial ${parcial.numero} (${parcial.estado}): la asistencia es inmutable y requiere reapertura formal (RN-06)`,
+      );
+    }
+  }
+
   async capturar(user: JwtPayload, cursoId: string, dto: CapturarAsistenciaDto) {
     const curso = await this.cursoConAcceso(user, cursoId);
+    aseguraEscrituraDocente(user, curso.docenteId); // FB-B-6
     const fecha = new Date(dto.fecha);
 
     const matriculas = dto.registros.map((r) => r.cadeteMatricula);
@@ -67,15 +92,38 @@ export class AsistenciaService {
       }
     }
 
-    await this.prisma.$transaction(
-      dto.registros.map((r) =>
-        this.prisma.asistencia.upsert({
+    await this.prisma.$transaction(async (tx) => {
+      // Re-aserción dentro de la transacción: el parcial pudo cerrarse entre el check y el write.
+      await this.asegurarVentanaEditable(tx, cursoId, fecha);
+      // FB-B-9 — el cambio de código (p. ej. F→J, RN-01-sensible) deja rastro; la captura
+      // inicial y el upsert idéntico no generan ruido en bitácora.
+      const previas = new Map(
+        (await tx.asistencia.findMany({ where: { cursoId, fecha, cadeteMatricula: { in: matriculas } } })).map((a) => [
+          a.cadeteMatricula,
+          a,
+        ]),
+      );
+      for (const r of dto.registros) {
+        const antes = previas.get(r.cadeteMatricula);
+        const fila = await tx.asistencia.upsert({
           where: { cadeteMatricula_cursoId_fecha: { cadeteMatricula: r.cadeteMatricula, cursoId, fecha } },
           create: { cadeteMatricula: r.cadeteMatricula, cursoId, fecha, codigo: r.codigo, capturadaPor: user.sub },
           update: { codigo: r.codigo, capturadaPor: user.sub, capturadaEn: new Date() },
-        }),
-      ),
-    );
+        });
+        if (antes && antes.codigo !== r.codigo) {
+          await tx.auditLog.create({
+            data: {
+              tipoEvento: 'ASISTENCIA_CAMBIO_CODIGO',
+              usuarioId: user.sub,
+              entidad: 'Asistencia',
+              entidadId: fila.id,
+              valorAnteriorJson: { codigo: antes.codigo },
+              valorNuevoJson: { codigo: r.codigo, cadeteMatricula: r.cadeteMatricula, cursoId, fecha: dto.fecha },
+            },
+          });
+        }
+      }
+    });
 
     return { capturados: dto.registros.length };
   }
@@ -101,9 +149,10 @@ export class AsistenciaService {
       orderBy: { nombreCompleto: 'asc' },
     });
 
+    const ventana = ventanaDeParcial(parcial); // FB-B-7: 409 si la ventana es nula
     const filas = await this.prisma.asistencia.groupBy({
       by: ['cadeteMatricula', 'codigo'],
-      where: { cursoId, fecha: { gte: parcial.fechaInicio!, lte: parcial.fechaFin! } },
+      where: { cursoId, fecha: { gte: ventana.inicio, lte: ventana.fin } },
       _count: { _all: true },
     });
     const conteos = new Map<string, { A: number; F: number; R: number; J: number }>();
@@ -147,8 +196,8 @@ export class AsistenciaController {
   }
 
   @Get('asistencia')
-  porFecha(@CurrentUser() user: JwtPayload, @Param('cursoId') cursoId: string, @Query('fecha') fecha: string) {
-    return this.asistencia.porFecha(user, cursoId, fecha);
+  porFecha(@CurrentUser() user: JwtPayload, @Param('cursoId') cursoId: string, @Query() q: FechaQueryDto) {
+    return this.asistencia.porFecha(user, cursoId, q.fecha);
   }
 
   @Get('parciales/:numero/resumen')

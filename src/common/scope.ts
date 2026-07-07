@@ -17,3 +17,13 @@ export function aseguraAccesoPlantel(user: JwtPayload, plantelId: string): void 
     throw new ForbiddenException('No tiene acceso a datos de otro plantel');
   }
 }
+
+/**
+ * FB-B-6 — Propiedad del curso: un Docente solo ESCRIBE en sus propios cursos
+ * (Coordinador y Operador no se restringen; las lecturas tampoco).
+ */
+export function aseguraEscrituraDocente(user: JwtPayload, docenteId: string): void {
+  if (user.rol === 'Docente' && docenteId !== user.sub) {
+    throw new ForbiddenException('Un Docente solo puede operar sobre sus propios cursos');
+  }
+}

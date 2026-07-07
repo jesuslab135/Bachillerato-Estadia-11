@@ -103,6 +103,9 @@ export class CursoService {
     if (grupo.plantelId !== periodo.plantelId) {
       throw new BadRequestException('El grupo y el periodo pertenecen a planteles distintos');
     }
+    // FB-B-6 — misma validación que reasignarDocente: rol Docente y plantel del grupo.
+    if (docente.rol !== 'Docente') throw new BadRequestException('El usuario indicado no tiene rol Docente');
+    if (docente.plantelId !== grupo.plantelId) throw new BadRequestException('El docente pertenece a otro plantel');
     aseguraAccesoPlantel(user, grupo.plantelId);
 
     try {

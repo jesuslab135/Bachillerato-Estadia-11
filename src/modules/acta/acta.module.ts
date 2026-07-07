@@ -13,12 +13,12 @@ import {
   Post,
 } from '@nestjs/common';
 import { createHash } from 'crypto';
-import { IsIn, IsNumber, IsOptional, IsString, Max, Min, MinLength } from 'class-validator';
-import { TipoExamen } from '@prisma/client';
+import { IsBoolean, IsIn, IsNumber, IsOptional, IsString, Max, Min, MinLength } from 'class-validator';
+import { Prisma, TipoExamen } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CurrentUser, Roles } from '../../auth/decorators';
 import { JwtPayload } from '../../auth/auth.types';
-import { aseguraAccesoPlantel } from '../../common/scope';
+import { aseguraAccesoPlantel, aseguraEscrituraDocente } from '../../common/scope';
 import { CalificacionModule, CalificacionService } from '../calificacion/calificacion.module';
 import {
   CALIF_MAX,
@@ -36,7 +36,8 @@ class RecuperacionDto {
   @IsString() @MinLength(1) cadeteMatricula!: string;
   @IsIn(TIPOS_RECUPERACION) tipo!: TipoExamen;
   @IsOptional() @IsNumber() @Min(CALIF_MIN) @Max(CALIF_MAX) valor?: number;
-  @IsOptional() np?: boolean;
+  // FB-B-7 — mismo patrón que ExamenRegistroDto: el flag NP se valida como boolean.
+  @IsOptional() @IsBoolean() np?: boolean;
 }
 
 interface FilaActa {
@@ -72,10 +73,25 @@ export class ActaService {
     return this.prisma.acta.findFirst({ where: { cursoId }, orderBy: { version: 'desc' } });
   }
 
-  /** RF-ACTA-01 — Crea una nueva versión del acta (reapertura → versión siguiente, RN-06). */
-  async generar(cursoId: string) {
-    const ultima = await this.actaVigente(cursoId);
-    return this.prisma.acta.create({ data: { cursoId, version: (ultima?.version ?? 0) + 1 } });
+  /** FB-B-9 — hash canónico del contenido del acta (se fija al generar y al firmar). */
+  private hashDocumento(contenido: unknown): string {
+    return createHash('sha256').update(JSON.stringify(contenido)).digest('hex');
+  }
+
+  /**
+   * RF-ACTA-01 — Crea una nueva versión del acta (reapertura → versión siguiente, RN-06).
+   * FB-B-4 — acepta el TransactionClient del workflow para generar el acta en la misma
+   * transacción que la transición a Validado; el unique (cursoId, version) es el cinturón
+   * final contra la doble generación concurrente.
+   * FB-B-9 — el hash de integridad se calcula y persiste AQUÍ (y al firmar); el export es GET puro.
+   */
+  async generar(user: JwtPayload, cursoId: string, tx: Prisma.TransactionClient = this.prisma) {
+    const curso = await tx.curso.findUniqueOrThrow({ where: { id: cursoId } });
+    const ultima = await tx.acta.findFirst({ where: { cursoId }, orderBy: { version: 'desc' } });
+    const version = (ultima?.version ?? 0) + 1;
+    const cadetes = await this.filas(user, cursoId, curso.grupoId);
+    const hashPdf = this.hashDocumento({ cursoId, version, firmadaDocenteEn: null, firmadaCoordinacionEn: null, cadetes });
+    return tx.acta.create({ data: { cursoId, version, hashPdf } });
   }
 
   private async finalesPorCadete(user: JwtPayload, cursoId: string): Promise<Map<string, [NotaParcial, NotaParcial, NotaParcial]>> {
@@ -152,6 +168,7 @@ export class ActaService {
   /** RF-ACTA-03/04 — Captura una instancia de recuperación, gated por elegibilidad (RN-04). */
   async capturarRecuperacion(user: JwtPayload, cursoId: string, dto: RecuperacionDto) {
     const curso = await this.cursoConAcceso(user, cursoId);
+    aseguraEscrituraDocente(user, curso.docenteId); // FB-B-6
     if (!(await this.actaVigente(cursoId))) throw new BadRequestException('El acta aún no se ha generado');
 
     const cadete = await this.prisma.cadete.findUnique({ where: { matricula: dto.cadeteMatricula } });
@@ -173,30 +190,86 @@ export class ActaService {
     if (!esNP && typeof dto.valor !== 'number') throw new BadRequestException('Indique un valor [0,10] o np:true');
     const data = { valor: esNP ? null : dto.valor!, estatus: esNP ? ('NP' as const) : ('PRESENTADO' as const), capturadoPor: user.sub };
     const p3 = await this.parcial3(cursoId);
-    await this.prisma.examen.upsert({
-      where: { cadeteMatricula_parcialId_tipo: { cadeteMatricula: dto.cadeteMatricula, parcialId: p3.id, tipo: dto.tipo } },
-      create: { cadeteMatricula: dto.cadeteMatricula, parcialId: p3.id, tipo: dto.tipo, ...data },
-      update: data,
+    // FB-B-9 — la recuperación deja rastro (viejo→nuevo); sin ruido si el upsert es idéntico.
+    await this.prisma.$transaction(async (tx) => {
+      const antes = await tx.examen.findUnique({
+        where: { cadeteMatricula_parcialId_tipo: { cadeteMatricula: dto.cadeteMatricula, parcialId: p3.id, tipo: dto.tipo } },
+      });
+      const valorAntes = antes?.valor === null || antes?.valor === undefined ? null : Number(antes.valor);
+      const fila = await tx.examen.upsert({
+        where: { cadeteMatricula_parcialId_tipo: { cadeteMatricula: dto.cadeteMatricula, parcialId: p3.id, tipo: dto.tipo } },
+        create: { cadeteMatricula: dto.cadeteMatricula, parcialId: p3.id, tipo: dto.tipo, ...data },
+        update: data,
+      });
+      if (!antes || valorAntes !== data.valor || antes.estatus !== data.estatus) {
+        await tx.auditLog.create({
+          data: {
+            tipoEvento: 'RECUPERACION_CAPTURA',
+            usuarioId: user.sub,
+            entidad: 'Examen',
+            entidadId: fila.id,
+            valorAnteriorJson: antes ? { valor: valorAntes, estatus: antes.estatus } : undefined,
+            valorNuevoJson: { tipo: dto.tipo, valor: data.valor, estatus: data.estatus, cadeteMatricula: dto.cadeteMatricula },
+          },
+        });
+      }
     });
     return { ok: true };
   }
 
-  /** RF-ACTA-06 — Doble firma: Docente firma como autor, Coordinación como validador. */
+  /**
+   * RF-ACTA-06 — Doble firma: Docente firma como autor, Coordinación como validador.
+   * FB-B-9 — la firma recalcula y persiste el hash (el contenido firmado queda sellado)
+   * y deja rastro en bitácora.
+   */
   async firmar(user: JwtPayload, cursoId: string) {
-    await this.cursoConAcceso(user, cursoId);
+    const curso = await this.cursoConAcceso(user, cursoId);
+    aseguraEscrituraDocente(user, curso.docenteId); // FB-B-6: solo el titular firma como docente
     const acta = await this.actaVigente(cursoId);
     if (!acta) throw new NotFoundException('El acta aún no se ha generado');
     const data = user.rol === 'Docente' ? { firmadaDocenteEn: new Date() } : { firmadaCoordinacionEn: new Date() };
-    return this.prisma.acta.update({ where: { id: acta.id }, data });
+    const cadetes = await this.filas(user, cursoId, curso.grupoId);
+    return this.prisma.$transaction(async (tx) => {
+      const firmada = await tx.acta.update({ where: { id: acta.id }, data });
+      const hashPdf = this.hashDocumento({
+        cursoId,
+        version: firmada.version,
+        firmadaDocenteEn: firmada.firmadaDocenteEn,
+        firmadaCoordinacionEn: firmada.firmadaCoordinacionEn,
+        cadetes,
+      });
+      const sellada = await tx.acta.update({ where: { id: acta.id }, data: { hashPdf } });
+      await tx.auditLog.create({
+        data: {
+          tipoEvento: 'ACTA_FIRMA',
+          usuarioId: user.sub,
+          entidad: 'Acta',
+          entidadId: acta.id,
+          valorAnteriorJson: {
+            firmadaDocenteEn: acta.firmadaDocenteEn,
+            firmadaCoordinacionEn: acta.firmadaCoordinacionEn,
+            hashPdf: acta.hashPdf,
+          },
+          valorNuevoJson: {
+            rol: user.rol,
+            firmadaDocenteEn: sellada.firmadaDocenteEn,
+            firmadaCoordinacionEn: sellada.firmadaCoordinacionEn,
+            hashPdf,
+          },
+        },
+      });
+      return sellada;
+    });
   }
 
-  /** RF-ACTA-07 — Exportación: documento canónico + hash de integridad SHA-256 (PDF/A en capa de reportes). */
+  /**
+   * RF-ACTA-07 — Exportación: documento canónico + hash de integridad SHA-256 (PDF/A en capa
+   * de reportes). FB-B-9 — GET puro: devuelve el hash persistido (fijado al generar/firmar),
+   * sin efectos secundarios.
+   */
   async exportar(user: JwtPayload, cursoId: string) {
     const documento = await this.vista(user, cursoId);
-    const acta = await this.actaVigente(cursoId);
-    const hash = createHash('sha256').update(JSON.stringify(documento)).digest('hex');
-    await this.prisma.acta.update({ where: { id: acta!.id }, data: { hashPdf: hash } });
-    return { version: documento.version, hash, documento };
+    return { version: documento.version, hash: documento.hashPdf, documento };
   }
 }
 

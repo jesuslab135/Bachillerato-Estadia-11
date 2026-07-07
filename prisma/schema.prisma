@@ -132,6 +132,8 @@ model Cadete {
   examenes       Examen[]
   puntosExtra    PuntoExtra[]
 
+  // FB-B-8: el roster por grupo se consulta en cada pantalla de captura.
+  @@index([grupoActualId])
   @@map("cadete")
 }
 
@@ -236,6 +238,8 @@ model Actividad {
 
   // Máximo 30 por (parcial, tipo): unicidad de orden + CHECK orden 1..30.
   @@unique([parcialId, tipo, orden])
+  // FB-B-8: listado de actividades por parcial (matriz de captura y cálculo).
+  @@index([parcialId])
   @@map("actividad")
 }
 
@@ -253,6 +257,8 @@ model Asistencia {
 
   // Asistencia única por (cadete, curso, fecha).
   @@unique([cadeteMatricula, cursoId, fecha])
+  // FB-B-8: recálculo de SDE/faltas por ventana de parcial (curso + rango de fechas).
+  @@index([cursoId, fecha])
   @@map("asistencia")
 }
 
@@ -268,6 +274,8 @@ model Calificacion {
   actividad       Actividad @relation(fields: [actividadId], references: [id])
 
   @@unique([cadeteMatricula, actividadId])
+  // FB-B-8: calificaciones por actividad (matriz y cálculo del parcial).
+  @@index([actividadId])
   @@map("calificacion")
 }
 
@@ -285,6 +293,8 @@ model Examen {
   parcial         Parcial       @relation(fields: [parcialId], references: [id])
 
   @@unique([cadeteMatricula, parcialId, tipo])
+  // FB-B-8: exámenes por parcial (cierre, cálculo y acta).
+  @@index([parcialId])
   @@map("examen")
 }
 

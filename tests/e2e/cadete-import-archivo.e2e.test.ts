@@ -26,6 +26,7 @@ const track = (m: string) => {
 const CSV_MAT = track(uniq('CSVF'));
 const XLSX_MAT = track(uniq('XLSF'));
 const DEF_MAT = track(uniq('DEFG'));
+const QUOTE_MAT = track(uniq('QCSV'));
 
 beforeAll(async () => {
   app = await createTestApp();
@@ -85,11 +86,39 @@ describe('POST /cadetes/import/archivo (RF-CAT-07)', () => {
     expect(cad?.grupoActualId).toBe(grupoA);
   });
 
+  it('parsea campos entrecomillados con comas (RFC 4180): "Pérez, Juan" (FB-B-7)', async () => {
+    const csv = `matricula,nombreCompleto,grupoId\n${QUOTE_MAT},"Pérez, Juan",${grupoA}`;
+    const res = await http
+      .post('/api/cadetes/import/archivo')
+      .set(auth(coordA))
+      .attach('archivo', Buffer.from(csv, 'utf-8'), 'cadetes.csv')
+      .expect(201);
+    expect(res.body.insertados).toBe(1);
+    const cad = await prisma.cadete.findUnique({ where: { matricula: QUOTE_MAT } });
+    expect(cad?.nombreCompleto).toBe('Pérez, Juan');
+  });
+
   it('rechaza un formato no soportado (400)', async () => {
     await http
       .post('/api/cadetes/import/archivo')
       .set(auth(coordA))
       .attach('archivo', Buffer.from('hola', 'utf-8'), 'datos.txt')
+      .expect(400);
+  });
+
+  it('rechaza un .xlsx falso (texto renombrado, sin firma PK) (400, FB-B-5)', async () => {
+    await http
+      .post('/api/cadetes/import/archivo')
+      .set(auth(coordA))
+      .attach('archivo', Buffer.from('matricula,nombreCompleto\nX,Texto Plano', 'utf-8'), 'cadetes.xlsx')
+      .expect(400);
+  });
+
+  it('rechaza un .csv con contenido binario (400, FB-B-5)', async () => {
+    await http
+      .post('/api/cadetes/import/archivo')
+      .set(auth(coordA))
+      .attach('archivo', Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x01, 0x02]), 'cadetes.csv')
       .expect(400);
   });
 

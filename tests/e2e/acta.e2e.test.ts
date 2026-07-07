@@ -185,6 +185,31 @@ describe('Doble firma y exportación (RF-ACTA-06/07)', () => {
     const acta = await actaDe();
     expect(acta.hashPdf).toBe(res.body.hash);
   });
+
+  it('el export es idempotente: GET no muta y el hash persistido no cambia (FB-B-9)', async () => {
+    const antes = await prisma.acta.findFirstOrThrow({ where: { cursoId }, orderBy: { version: 'desc' } });
+    const r1 = await http.get(`/api/cursos/${cursoId}/acta/export`).set(auth(coordA)).expect(200);
+    const r2 = await http.get(`/api/cursos/${cursoId}/acta/export`).set(auth(coordA)).expect(200);
+    expect(r1.body.hash).toBe(antes.hashPdf);
+    expect(r2.body.hash).toBe(antes.hashPdf);
+    const despues = await prisma.acta.findFirstOrThrow({ where: { id: antes.id } });
+    expect(despues.hashPdf).toBe(antes.hashPdf);
+  });
+
+  it('las firmas dejan rastro en bitácora (FB-B-9)', async () => {
+    const acta = await prisma.acta.findFirstOrThrow({ where: { cursoId }, orderBy: { version: 'desc' } });
+    const eventos = await prisma.auditLog.findMany({ where: { tipoEvento: 'ACTA_FIRMA', entidadId: acta.id } });
+    expect(eventos.length).toBeGreaterThanOrEqual(2); // docente + coordinación
+  });
+
+  it('la captura de recuperación deja rastro en bitácora (FB-B-9)', async () => {
+    const p3 = await prisma.parcial.findUniqueOrThrow({ where: { cursoId_numero: { cursoId, numero: 3 } } });
+    const examen = await prisma.examen.findUniqueOrThrow({
+      where: { cadeteMatricula_parcialId_tipo: { cadeteMatricula: CAD_ORD, parcialId: p3.id, tipo: 'Ordinario' } },
+    });
+    const eventos = await prisma.auditLog.findMany({ where: { tipoEvento: 'RECUPERACION_CAPTURA', entidadId: examen.id } });
+    expect(eventos.length).toBeGreaterThanOrEqual(1);
+  });
 });
 
 describe('Reapertura genera nueva versión (RN-06/RF-WF-04)', () => {

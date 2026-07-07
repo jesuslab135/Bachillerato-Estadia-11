@@ -2,6 +2,7 @@ import { Controller, Get, Injectable, Module } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CurrentUser } from '../../auth/decorators';
 import { JwtPayload } from '../../auth/auth.types';
+import { fechaLocalISO } from '../../domain';
 
 const DIAS_CIERRE_PROXIMO = 7;
 const UN_DIA_MS = 86_400_000;
@@ -18,7 +19,8 @@ export class DocenteService {
       include: { materia: true, grupo: true, parciales: true },
     });
 
-    const hoy = new Date(new Date().toISOString().slice(0, 10));
+    // FB-B-10 — "hoy" en la zona del plantel (con UTC, de 18:00 a 00:00 locales salía el día siguiente).
+    const hoy = new Date(fechaLocalISO());
     const limite = new Date(hoy.getTime() + DIAS_CIERRE_PROXIMO * UN_DIA_MS);
 
     const filas = await Promise.all(

@@ -96,6 +96,19 @@ describe('Bloqueo por intentos fallidos (RF-AUTH-05)', () => {
   });
 });
 
+describe('Contador de intentos fallidos atómico (FB-B-9)', () => {
+  it('dos logins fallidos concurrentes suman 2 (increment, no read-modify-write)', async () => {
+    const CONC = 'e2e.concurrente@sga.local';
+    await prisma.usuario.deleteMany({ where: { email: CONC } });
+    const user = await crearUsuario(CONC, false);
+    const fallo = () => http.post('/api/auth/login').send({ email: CONC, password: 'mala' }).expect(401);
+    await Promise.all([fallo(), fallo()]);
+    const actualizado = await prisma.usuario.findUniqueOrThrow({ where: { id: user.id } });
+    expect(actualizado.intentosFallidos).toBe(2);
+    await prisma.usuario.delete({ where: { id: user.id } });
+  });
+});
+
 describe('Primer ingreso obliga a cambiar contraseña (RF-AUTH-04)', () => {
   it('bloquea el acceso hasta cambiar, luego permite', async () => {
     const login = await http.post('/api/auth/login').send({ email: MUSTCHANGE, password: PASS }).expect(200);

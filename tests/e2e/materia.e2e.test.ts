@@ -105,4 +105,9 @@ describe('DELETE /api/materias/:clave (borrado lógico)', () => {
     const conInactivas = await http.get('/api/materias?incluirInactivas=true').set(auth(coord));
     expect(conInactivas.body.map((m: { clave: string }) => m.clave)).toContain('ZZC-9');
   });
+
+  it('incluirInactivas=false NO devuelve inactivas (FB-B-7, boolean de query explícito)', async () => {
+    const res = await http.get('/api/materias?incluirInactivas=false').set(auth(coord)).expect(200);
+    expect(res.body.map((m: { clave: string }) => m.clave)).not.toContain('ZZC-9');
+  });
 });

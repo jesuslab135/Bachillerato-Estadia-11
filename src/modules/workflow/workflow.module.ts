@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   Get,
   Header,
@@ -19,7 +20,9 @@ import { EstadoParcial, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CurrentUser, Roles } from '../../auth/decorators';
 import { JwtPayload } from '../../auth/auth.types';
-import { aseguraAccesoPlantel } from '../../common/scope';
+import { aseguraAccesoPlantel, aseguraEscrituraDocente } from '../../common/scope';
+import { ventanaDeParcial } from '../../common/parcial';
+import { celdaCsv } from '../../common/csv';
 import { esSDE, pesoExEnRango, pesosSumanUno } from '../../domain';
 import { ActaModule, ActaService } from '../acta/acta.module';
 
@@ -52,7 +55,11 @@ export class WorkflowService {
     return { curso, parcial };
   }
 
-  /** Transición atómica: cambia estado + WorkflowEvent + AuditLog (append-only). */
+  /**
+   * Transición atómica: cambia estado + WorkflowEvent + AuditLog (append-only).
+   * FB-B-3 — compare-and-swap: el UPDATE exige el estado esperado; si otro proceso
+   * ya transicionó el parcial (TOCTOU), se responde 409 y no se escribe nada.
+   */
   private async transicionar(
     tx: Prisma.TransactionClient,
     parcial: { id: string; estado: EstadoParcial },
@@ -62,7 +69,13 @@ export class WorkflowService {
     ip: string | null,
     motivo?: string,
   ) {
-    await tx.parcial.update({ where: { id: parcial.id }, data: { estado: nuevo } });
+    const cas = await tx.parcial.updateMany({
+      where: { id: parcial.id, estado: parcial.estado },
+      data: { estado: nuevo },
+    });
+    if (cas.count === 0) {
+      throw new ConflictException(`El parcial ya no está en estado ${parcial.estado}: otra operación lo transicionó (reintente)`);
+    }
     await tx.workflowEvent.create({ data: { parcialId: parcial.id, accion, usuarioId: user.sub, motivo: motivo ?? null } });
     await tx.auditLog.create({
       data: {
@@ -80,8 +93,9 @@ export class WorkflowService {
   /** RF-WF-02 — Condiciones de cierre del parcial. */
   async cerrar(user: JwtPayload, cursoId: string, numero: number, ip: string | null) {
     const { curso, parcial } = await this.cargarParcial(user, cursoId, numero);
+    aseguraEscrituraDocente(user, curso.docenteId); // FB-B-6: solo el titular cierra su curso
     if (!['Borrador', 'Reabierto'].includes(parcial.estado)) {
-      throw new BadRequestException(`No se puede cerrar un parcial en estado ${parcial.estado}`);
+      throw new ConflictException(`No se puede cerrar un parcial en estado ${parcial.estado}`);
     }
     // RF-WF-02: el cierre exige fecha posterior al inicio del periodo de cierre (si está definido).
     if (parcial.fechaAperturaCierre && new Date() < parcial.fechaAperturaCierre) {
@@ -111,22 +125,24 @@ export class WorkflowService {
 
   async validar(user: JwtPayload, cursoId: string, numero: number, ip: string | null) {
     const { parcial } = await this.cargarParcial(user, cursoId, numero);
-    if (parcial.estado !== 'CerradoDocente') throw new BadRequestException('Solo se valida un parcial en CerradoDocente');
-    await this.prisma.$transaction((tx) => this.transicionar(tx, parcial, 'Validado', 'validar', user, ip));
+    if (parcial.estado !== 'CerradoDocente') throw new ConflictException('Solo se valida un parcial en CerradoDocente');
 
-    // RF-ACTA-01 — Validar el 3er parcial (con los otros 2 ya validados) genera el acta.
-    if (numero === 3) {
-      const previos = await this.prisma.parcial.findMany({ where: { cursoId, numero: { in: [1, 2] } } });
-      if (previos.length === 2 && previos.every((p) => p.estado === 'Validado')) {
-        await this.acta.generar(cursoId);
+    // RF-ACTA-01 / FB-B-4 — con CUALQUIER orden de validación: si al validar este parcial
+    // los 3 quedan Validado, el acta se genera dentro de la MISMA transacción que la
+    // transición (el CAS de `transicionar` garantiza una sola generación por ciclo).
+    await this.prisma.$transaction(async (tx) => {
+      await this.transicionar(tx, parcial, 'Validado', 'validar', user, ip);
+      const estados = await tx.parcial.findMany({ where: { cursoId }, select: { estado: true } });
+      if (estados.length === 3 && estados.every((p) => p.estado === 'Validado')) {
+        await this.acta.generar(user, cursoId, tx);
       }
-    }
+    });
     return { estado: 'Validado' };
   }
 
   async devolver(user: JwtPayload, cursoId: string, numero: number, comentario: string, ip: string | null) {
     const { parcial } = await this.cargarParcial(user, cursoId, numero);
-    if (parcial.estado !== 'CerradoDocente') throw new BadRequestException('Solo se devuelve un parcial en CerradoDocente');
+    if (parcial.estado !== 'CerradoDocente') throw new ConflictException('Solo se devuelve un parcial en CerradoDocente');
     await this.prisma.$transaction((tx) => this.transicionar(tx, parcial, 'Borrador', 'devolver', user, ip, comentario));
     return { estado: 'Borrador' };
   }
@@ -134,7 +150,7 @@ export class WorkflowService {
   /** RN-06 — Reapertura de un parcial validado (motivo obligatorio). La nueva versión de acta llega en I8. */
   async reabrir(user: JwtPayload, cursoId: string, numero: number, motivo: string, ip: string | null) {
     const { parcial } = await this.cargarParcial(user, cursoId, numero);
-    if (parcial.estado !== 'Validado') throw new BadRequestException('Solo se reabre un parcial Validado');
+    if (parcial.estado !== 'Validado') throw new ConflictException('Solo se reabre un parcial Validado');
     await this.prisma.$transaction((tx) => this.transicionar(tx, parcial, 'Reabierto', 'reabrir', user, ip, motivo));
     return { estado: 'Reabierto' };
   }
@@ -144,10 +160,11 @@ export class WorkflowService {
     return this.prisma.workflowEvent.findMany({ where: { parcialId: parcial.id }, orderBy: { timestamp: 'asc' } });
   }
 
-  private async faltasEnParcial(cursoId: string, parcial: { fechaInicio: Date | null; fechaFin: Date | null }) {
+  private async faltasEnParcial(cursoId: string, parcial: { numero: number; fechaInicio: Date | null; fechaFin: Date | null }) {
+    const ventana = ventanaDeParcial(parcial); // FB-B-7: 409 si la ventana es nula
     const filas = await this.prisma.asistencia.groupBy({
       by: ['cadeteMatricula'],
-      where: { cursoId, codigo: 'F', fecha: { gte: parcial.fechaInicio!, lte: parcial.fechaFin! } },
+      where: { cursoId, codigo: 'F', fecha: { gte: ventana.inicio, lte: ventana.fin } },
       _count: { _all: true },
     });
     return new Map(filas.map((f) => [f.cadeteMatricula, f._count._all]));
@@ -216,12 +233,6 @@ const BITACORA_LIMITE = 500;
 
 const CAMPOS_CSV = ['timestamp', 'tipoEvento', 'entidad', 'entidadId', 'usuarioId', 'ip', 'valorAnteriorJson', 'valorNuevoJson'] as const;
 
-/** Escapa un campo CSV (RFC 4180): comillas dobles duplicadas y envoltura si hay separador/salto. */
-function celdaCsv(valor: unknown): string {
-  const s = valor === null || valor === undefined ? '' : typeof valor === 'object' ? JSON.stringify(valor) : String(valor);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-}
-
 @Controller('bitacora')
 export class BitacoraController {
   constructor(private readonly prisma: PrismaService) {}
@@ -239,11 +250,33 @@ export class BitacoraController {
     return where;
   }
 
+  /**
+   * FB-B-6 — Scoping por plantel: el Coordinador solo ve eventos cuyo autor pertenece a su
+   * plantel (join vía usuario, el vínculo más simple y correcto disponible en AuditLog);
+   * el Operador es global.
+   */
+  private async filtroPorPlantel(user: JwtPayload): Promise<Prisma.AuditLogWhereInput> {
+    if (user.rol === 'Operador') return {};
+    const usuarios = await this.prisma.usuario.findMany({
+      where: { plantelId: user.plantelId ?? '__sin_plantel__' },
+      select: { id: true },
+    });
+    return { usuarioId: { in: usuarios.map((u) => u.id) } };
+  }
+
+  private async filas(user: JwtPayload, q: BitacoraQueryDto) {
+    return this.prisma.auditLog.findMany({
+      where: { AND: [this.construirWhere(q), await this.filtroPorPlantel(user)] },
+      orderBy: { timestamp: 'desc' },
+      take: BITACORA_LIMITE,
+    });
+  }
+
   /** RF-WF-05 — Consulta filtrada de la bitácora. */
   @Roles('Coordinador', 'Operador')
   @Get()
-  consultar(@Query() q: BitacoraQueryDto) {
-    return this.prisma.auditLog.findMany({ where: this.construirWhere(q), orderBy: { timestamp: 'desc' }, take: BITACORA_LIMITE });
+  consultar(@CurrentUser() user: JwtPayload, @Query() q: BitacoraQueryDto) {
+    return this.filas(user, q);
   }
 
   /** RF-WF-05 — Exportación CSV de la bitácora filtrada. */
@@ -251,8 +284,8 @@ export class BitacoraController {
   @Get('export')
   @Header('Content-Type', 'text/csv; charset=utf-8')
   @Header('Content-Disposition', 'attachment; filename="bitacora.csv"')
-  async exportar(@Query() q: BitacoraQueryDto) {
-    const filas = await this.prisma.auditLog.findMany({ where: this.construirWhere(q), orderBy: { timestamp: 'desc' }, take: BITACORA_LIMITE });
+  async exportar(@CurrentUser() user: JwtPayload, @Query() q: BitacoraQueryDto) {
+    const filas = await this.filas(user, q);
     const lineas = [CAMPOS_CSV.join(',')];
     for (const f of filas) lineas.push(CAMPOS_CSV.map((c) => celdaCsv((f as Record<string, unknown>)[c])).join(','));
     return lineas.join('\n');

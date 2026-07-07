@@ -5,3 +5,4 @@ export * from './asistencia';
 export * from './pesos';
 export * from './parcial';
 export * from './semestre';
+export * from './fecha';
