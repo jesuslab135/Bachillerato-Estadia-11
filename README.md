@@ -17,6 +17,9 @@ npm run db:up               # levanta Postgres 15 en localhost:5433
 npm run prisma:deploy       # aplica migraciones
 npm run seed                # 2 planteles + 33 materias + roles base
 npm run seed:test           # opcional: limpia la DB y siembra datos de prueba end-to-end
+npm run seed:demo           # opcional: DEMO rica (2 planteles, 150 cadetes, 9 cursos en todos los
+                            #   estados, actas, bitácora) para revisar todas las pantallas y roles.
+                            #   Destructivo (TRUNCATE) — solo dev/QA, NUNCA contra datos reales.
 npm test                    # Vitest: dominio + integridad del modelo + e2e (requiere la DB arriba)
 npm run lint                # ESLint 9 (flat config, typescript-eslint) — FB-B-10
 ```

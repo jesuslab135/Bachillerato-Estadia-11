@@ -12,6 +12,7 @@
     "prisma:reset": "prisma migrate reset --force",
     "seed": "tsx prisma/seed.ts",
     "seed:test": "tsx Seed/seed-test.ts",
+    "seed:demo": "tsx Seed/seed-demo.ts",
     "start": "node -r @swc-node/register src/main.ts",
     "start:dev": "node --watch -r @swc-node/register src/main.ts",
     "build": "tsc -p tsconfig.json",
