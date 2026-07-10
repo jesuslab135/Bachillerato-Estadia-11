@@ -228,3 +228,20 @@ tests/e2e/               pruebas e2e de la API (supertest + Nest)
   (plan general militarizado, 6 semestres). Sustituibles por el plan oficial cuando
   esté disponible; el seed y su prueba leen de ese único módulo.
 - Claves de plantel `BM` / `BC` derivadas (no especificadas en `docs/`).
+
+## Despliegue (producción — VPS IONOS)
+
+Producción vive en `https://app.jesuslab135.com` (frontend + API en el mismo origen; nginx
+enruta `/api/*` al backend). Todo corre en Docker Compose en `/opt/sga` del VPS.
+
+- **CI/CD**: `.github/workflows/deploy.yml` — cada push a `main` corre pruebas (Postgres de
+  servicio + migraciones + seed), publica `ghcr.io/jesuslab135/sga-backend:prod` y despliega
+  por SSH (`docker compose pull backend && up -d backend`). Secrets del repo: `VPS_HOST`,
+  `VPS_USER`, `VPS_SSH_KEY`.
+- **Imagen**: `Dockerfile` multi-stage (Node 22 alpine); al arrancar ejecuta
+  `prisma migrate deploy` (idempotente) antes de `node dist/src/main.js`.
+- **Compose del VPS**: copia versionada en `deploy/` (nginx + certbot + postgres + backend +
+  frontend). Los `.env` reales viven solo en el VPS (`deploy/*.example` documenta las claves).
+- **`TRUST_PROXY=1`** en producción: tras el nginx del compose hay 1 salto de proxy; sin esto
+  el rate-limit por IP vería la IP del proxy para todos los clientes.
+- Detalle completo (certificados, cutover, restauración): `../docs/2026-07-10_despliegue-ionos.md`.
