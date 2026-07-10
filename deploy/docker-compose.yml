@@ -1,0 +1,84 @@
+# =========================================================
+# SGA-Militar — Docker Compose de producción (VPS IONOS)
+#
+# Vive en /opt/sga/ en el servidor (copia versionada en backend/deploy/).
+# Despliegue de un servicio:
+#   docker compose pull <servicio> && docker compose up -d <servicio>
+# Requiere en /opt/sga/: .env (POSTGRES_PASSWORD, GITHUB_OWNER),
+# .env.backend (ver .env.backend.example) y certbot/conf con los certificados.
+# =========================================================
+
+networks:
+  sga:
+    driver: bridge
+
+volumes:
+  sga_pgdata:
+
+services:
+
+  # Único servicio expuesto a internet: reverse proxy + TLS.
+  nginx:
+    image: nginx:alpine
+    container_name: sga_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/app.conf:/etc/nginx/conf.d/app.conf:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    networks:
+      - sga
+    depends_on:
+      - backend
+      - frontend
+
+  # Renovación automática de certificados cada 12 horas.
+  certbot:
+    image: certbot/certbot
+    container_name: sga_certbot
+    restart: unless-stopped
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot; sleep 12h & wait $${!}; done;'"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: sga_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sga
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?falta POSTGRES_PASSWORD en .env}
+      POSTGRES_DB: sga_militar
+    volumes:
+      - sga_pgdata:/var/lib/postgresql/data
+    networks:
+      - sga
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sga -d sga_militar"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Puerto NO expuesto al exterior.
+
+  backend:
+    image: ghcr.io/${GITHUB_OWNER}/sga-backend:prod
+    container_name: sga_backend
+    restart: unless-stopped
+    env_file:
+      - .env.backend
+    networks:
+      - sga
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    image: ghcr.io/${GITHUB_OWNER}/sga-frontend:prod
+    container_name: sga_frontend
+    restart: unless-stopped
+    networks:
+      - sga
